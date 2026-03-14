@@ -20,12 +20,12 @@ parser = argparse.ArgumentParser(description=__doc__)
 # parser.add_argument("-o", "--output-device", type=str, help="output device name", default=None)
 parser.add_argument("-c", "--channels", type=int, default=2, help="number of channels")
 parser.add_argument("-t", "--dtype", help="audio data type")
-parser.add_argument("-s", "--samplerate", type=float, help="sampling rate", default=48000)
+# parser.add_argument("-s", "--samplerate", type=float, help="sampling rate", default=48000)
 parser.add_argument("-b", "--blocksize", type=int, help="block size in frames, automatically determined from latency when 0", default=0)
 # TODO: dynamically determine latency by adjusting smaller and smaller until processing completes just under desired latency
 # parser.add_argument("-l", "--latency", type=float, help="desired latency between input and output", default='high')
 # TODO: change user input to seconds, size in frames is determined by sample rate
-parser.add_argument("-w", "--wave-buffer-size", type=float, help="wave buffer size in frames, context duration needed to understand noise", default=30000)
+parser.add_argument("-w", "--wave-buffer-size", type=float, help="wave buffer size in frames, context duration needed to understand noise", default=12000)
 # TODO: change user input to a percentage of blocksize
 parser.add_argument("-bl", "--blend-length", type=float, help="number of frames to crossfade between each block", default=400)
 
@@ -67,8 +67,10 @@ sd_latency = 0.06
 
 wave_buffer = np.zeros((args.wave_buffer_size, 2))
 wave_cut = None
+
 # TODO: Pull noise from recording
 # noise = np.zeros(args.wave_buffer_size)
+# noise_sr is used for all input and output sample rates so they match up.
 noise_sr, noise = read("noisy.wav")
 # print("noise SR:", noise_sr)
 # TODO: ensure noise sample rate same as signal
@@ -85,8 +87,8 @@ nr_time_mask_smooth_ms = 50
 nr_chunk_size = 60000
 nr_n_fft = 1024
 nr_padding = 30000
-nr_win_length = None
-nr_hop_length = None
+nr_win_length = nr_n_fft
+nr_hop_length = nr_win_length // 4
 
 ## stationary exclusive noise reduction params
 nr_s_n_std_thresh = 1.5
@@ -103,7 +105,7 @@ def callback(indata, outdata, frames, time, status):
     global wave_buffer
     global wave_cut
     # global block_num
-    print(status)
+    # print(status)
 
     audio = indata
     
@@ -113,14 +115,14 @@ def callback(indata, outdata, frames, time, status):
 
     if enable_noisereduction:
         if nr_stationary:
-                wave = nr.reduce_noise(wave_buffer.transpose(), sr=args.samplerate, stationary=True, y_noise=noise.transpose(),
+                wave = nr.reduce_noise(wave_buffer.transpose(), sr=noise_sr, stationary=True, y_noise=noise.transpose(),
                                 prop_decrease=nr_prop_decrease, n_std_thresh_stationary=nr_s_n_std_thresh,
                                 freq_mask_smooth_hz=nr_freq_mask_smooth_hz, time_mask_smooth_ms=nr_time_mask_smooth_ms,
                                 chunk_size=nr_chunk_size, n_fft=nr_n_fft, padding=nr_padding,
                                 win_length=nr_win_length, hop_length=nr_hop_length, use_torch=nr_torch)
                 wave = wave.transpose()
         else:
-                wave = nr.reduce_noise(wave_buffer.transpose(), sr=args.samplerate, prop_decrease=nr_prop_decrease,
+                wave = nr.reduce_noise(wave_buffer.transpose(), sr=noise_sr, prop_decrease=nr_prop_decrease,
                                     time_constant_s=nr_ns_time_constant_s,
                                     freq_mask_smooth_hz=nr_freq_mask_smooth_hz, time_mask_smooth_ms=nr_time_mask_smooth_ms,
                                     chunk_size=nr_chunk_size, n_fft=nr_n_fft, padding=nr_padding,
@@ -132,7 +134,7 @@ def callback(indata, outdata, frames, time, status):
     
 #     # for bug testing, save wave here for each block, with file name according to block number
 #     # block_num = block_num + 1
-#     # scipy.io.wavfile.write("out/" + str(block_num) + ".wav", args.samplerate, wave)
+#     # scipy.io.wavfile.write("out/" + str(block_num) + ".wav", noise_sr, wave)
 
     if wave_cut is None:
         wave_left = wave.shape[0] - frames - args.blend_length
@@ -144,7 +146,7 @@ def callback(indata, outdata, frames, time, status):
     outdata[:] = wave
 
 
-audio_stream = sd.Stream(samplerate=args.samplerate, blocksize=args.blocksize, 
+audio_stream = sd.Stream(samplerate=noise_sr, blocksize=args.blocksize, 
                                      channels=args.channels, latency=sd_latency, callback=callback)
 audio_devices = sd.query_devices()
 audio_hostapis = sd.query_hostapis()
@@ -197,7 +199,7 @@ layout = [[sg.Button('Noise Reduction Disabled', key='NR_ON', button_color="gray
         [sg.Text('Padding:'),
             sg.Slider(range=(10000, 60000), resolution=1000, default_value=30000, key='NR_PADDING', orientation='h', change_submits=True)],
         [sg.Text('Window Length:'),
-            sg.Slider(range=(100, 8192), resolution=2, default_value=1024, key='NR_WIN_LENGTH', orientation='h', change_submits=True)],
+            sg.Slider(range=(100, 1024), resolution=2, default_value=1024, key='NR_WIN_LENGTH', orientation='h', change_submits=True)],
         [sg.Text('Hop Length:'),
             sg.Slider(range=(25, 512), resolution=1, default_value=1024//4, key='NR_HOP_LENGTH', orientation='h', change_submits=True)],
         [sg.ButtonMenu('Device Settings', audio_device_menu_layout, key='DEVICE_SETTINGS')]]
@@ -230,18 +232,28 @@ while True:
         nr_prop_decrease = float(values['NR_PROP_DECREASE'])
     elif event == 'NR_S_N_STD_THRESH':
         nr_s_n_std_thresh = float(values['NR_S_N_STD_THRESH'])
+    elif event == 'NR_FREQ_MASK_SMOOTH_HZ':
+        nr_freq_mask_smooth_hz = int(values['NR_FREQ_MASK_SMOOTH_HZ'])
+        # constraint: nr_freq_mask_smooth_hz >= noise_sr / (nr_n_fft / 2)
     elif event == 'NR_TIME_MASK_SMOOTH_MS':
         nr_time_mask_smooth_ms = int(values['NR_TIME_MASK_SMOOTH_MS'])
     elif event == 'NR_CHUNK_SIZE':
         nr_chunk_size = int(values['NR_CHUNK_SIZE'])
     elif event == 'NR_N_FFT':
         nr_n_fft = int(values['NR_N_FFT'])
+        # constraint: 0 < nr_win_length <= n_fft
+        # constraint: nr_freq_mask_smooth_hz >= noise_sr / (nr_n_fft / 2)
+        if nr_n_fft < nr_win_length:
+            window['NR_WIN_LENGTH'].update(nr_n_fft, range=(100, nr_n_fft))
+            nr_win_length = nr_n_fft
+        else:
+            window['NR_WIN_LENGTH'].update(range=(100, nr_n_fft))
+
     elif event == 'NR_PADDING':
         nr_padding = int(values['NR_PADDING'])
     elif event == 'NR_WIN_LENGTH':
         nr_win_length = int(values['NR_WIN_LENGTH'])
-        # constraint 0 < win_length <= n_fft
-        
+        # constraint: 0 < win_length <= n_fft
     elif event == 'NR_HOP_LENGTH':
         nr_hop_length = int(values['NR_HOP_LENGTH'])
     elif event == 'DEVICE_SETTINGS':
@@ -265,14 +277,14 @@ while True:
             output_ID = int(audio_hostapis[api_ID]['default_output_device'])
             # For some reason some of the default devices are invalid. Try to instead find a valid device for that host API if it's invalid.
             try:
-                sd.check_input_settings(device = input_ID, samplerate=args.samplerate, blocksize=args.blocksize, 
+                sd.check_input_settings(device = input_ID, samplerate=noise_sr, blocksize=args.blocksize, 
                                      channels=args.channels, latency=sd_latency)
             except:
                 found_valid = False
                 for device in input_devices[api_ID]:
                     try:
                         input_ID = device['index']
-                        sd.check_input_settings(device = input_ID, samplerate=args.samplerate, blocksize=args.blocksize, 
+                        sd.check_input_settings(device = input_ID, samplerate=noise_sr, blocksize=args.blocksize, 
                                      channels=args.channels, latency=sd_latency)
                     except:
                         # print('input device', input_ID, 'causes exception')
@@ -286,14 +298,14 @@ while True:
                     print('No valid input device found for this host API :(')
             
             try:
-                sd.check_output_settings(device = output_ID, samplerate=args.samplerate, blocksize=args.blocksize, 
+                sd.check_output_settings(device = output_ID, samplerate=noise_sr, blocksize=args.blocksize, 
                                      channels=args.channels, latency=sd_latency)
             except:
                 found_valid = False
                 for device in output_devices[api_ID]:
                     try:
                         output_ID = device['index']
-                        sd.check_output_settings(device = output_ID, samplerate=args.samplerate, blocksize=args.blocksize,
+                        sd.check_output_settings(device = output_ID, samplerate=noise_sr, blocksize=args.blocksize,
                                      channels=args.channels, latency=sd_latency)
                     except:
                         # print('output device', output_ID, 'causes exception')
@@ -310,7 +322,7 @@ while True:
             
             # Stop the audio stream and replace it with a new one that uses the specified input device, then start it back.
             audio_stream.stop()
-            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=args.samplerate, blocksize=args.blocksize, 
+            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=args.blocksize, 
                                      channels=args.channels, latency=sd_latency, callback=callback)
             audio_stream.start()
 
@@ -322,7 +334,7 @@ while True:
             
             # Stop the audio stream and replace it with a new one that uses the specified input device, then start it back.
             audio_stream.stop()
-            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=args.samplerate, blocksize=args.blocksize,  
+            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=args.blocksize,  
                                      channels=args.channels, latency=sd_latency, callback=callback)
             audio_stream.start()
 
@@ -334,6 +346,6 @@ while True:
             
             # Stop the audio stream and replace it with a new one that uses the specified input device, then start it back.
             audio_stream.stop()
-            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=args.samplerate, blocksize=args.blocksize, 
+            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=args.blocksize, 
                                      channels=args.channels, latency=sd_latency, callback=callback)
             audio_stream.start()
