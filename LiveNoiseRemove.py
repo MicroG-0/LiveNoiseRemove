@@ -25,7 +25,7 @@ parser.add_argument("-b", "--blocksize", type=int, help="block size in frames, a
 # TODO: dynamically determine latency by adjusting smaller and smaller until processing completes just under desired latency
 # parser.add_argument("-l", "--latency", type=float, help="desired latency between input and output", default='high')
 # TODO: change user input to seconds, size in frames is determined by sample rate
-parser.add_argument("-w", "--wave-buffer-size", type=float, help="wave buffer size in frames, context duration needed to understand noise", default=18000)
+parser.add_argument("-w", "--wave-buffer-size", type=float, help="wave buffer size in frames, context duration needed to understand noise", default=30000)
 # TODO: change user input to a percentage of blocksize
 parser.add_argument("-bl", "--blend-length", type=float, help="number of frames to crossfade between each block", default=400)
 
@@ -63,7 +63,7 @@ def next_waves(wave, wave_cut, frames):
 
 # Sound device latency setting
 # sd_latency = 'low'
-sd_latency = 0.4
+sd_latency = 0.06
 
 wave_buffer = np.zeros((args.wave_buffer_size, 2))
 wave_cut = None
@@ -77,8 +77,8 @@ noise_sr, noise = read("noisy.wav")
 enable_noisereduction = False
 nr_stationary = True
 # if cuda is available, use it
-nr_torch = device == "cuda"
-nr_jobs = 1
+nr_torch = torch.cuda.is_available()
+# nr_jobs = 1
 nr_prop_decrease = 1.0
 nr_freq_mask_smooth_hz = 500
 nr_time_mask_smooth_ms = 50
@@ -240,6 +240,8 @@ while True:
         nr_padding = int(values['NR_PADDING'])
     elif event == 'NR_WIN_LENGTH':
         nr_win_length = int(values['NR_WIN_LENGTH'])
+        # constraint 0 < win_length <= n_fft
+        
     elif event == 'NR_HOP_LENGTH':
         nr_hop_length = int(values['NR_HOP_LENGTH'])
     elif event == 'DEVICE_SETTINGS':
