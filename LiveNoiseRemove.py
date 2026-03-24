@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
-import argparse
 from scipy.io.wavfile import read
 
 import numpy as np
 import noisereduce as nr
 import torch
+import math
 
 import FreeSimpleGUI as sg
 # import threading
@@ -15,65 +15,39 @@ import sounddevice as sd
 
 # TODO: add UI for each of these options
 # TODO: add settings saving and loading, which autosaves the most recently used settings to an .ini
-parser = argparse.ArgumentParser(description=__doc__)
-# parser.add_argument("-i", "--input-device", type=str, help="input device name", default=None)
-# parser.add_argument("-o", "--output-device", type=str, help="output device name", default=None)
-parser.add_argument("-c", "--channels", type=int, default=2, help="number of channels")
-parser.add_argument("-t", "--dtype", help="audio data type")
-# parser.add_argument("-s", "--samplerate", type=float, help="sampling rate", default=48000)
-parser.add_argument("-b", "--blocksize", type=int, help="block size in frames, automatically determined from latency when 0", default=0)
-# TODO: dynamically determine latency by adjusting smaller and smaller until processing completes just under desired latency
-# parser.add_argument("-l", "--latency", type=float, help="desired latency between input and output", default='high')
-# TODO: change user input to seconds, size in frames is determined by sample rate
-parser.add_argument("-w", "--wave-buffer-size", type=float, help="wave buffer size in frames, context duration needed to understand noise", default=12000)
-# TODO: change user input to a percentage of blocksize
-parser.add_argument("-bl", "--blend-length", type=float, help="number of frames to crossfade between each block", default=400)
-
-
-args, unknown = parser.parse_known_args()
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 print("Running on device:", device)
 
-# removes the last args.blend_length worth from the returned wave, at the cost of latency
-# crossfades the first args.blend_length with wave_cut cut from the previous wave
-# returns the cut part to blend with the next wave
-# |  wave  |cut|
-#          | next wave |cut|
-#                      | next next wave |cut|
-def next_waves(wave, wave_cut, frames):
-    wave_channels = wave.shape[1]
-    # print("wave shape:", wave.shape)
-    # print("wave cut shape:", wave_cut.shape)
-    wave_left = wave.shape[0] - frames - args.blend_length
-    wave_right = wave.shape[0] - args.blend_length
-    wave_return = wave[wave_left:wave_right].squeeze()
-    # print("wave return:", wave_return.shape)
-    wave_cut_next = wave[wave_right:].squeeze()
-    # print("wave cut next:", wave_cut_next.shape)
 
-    # TODO: improve blend smoothness, or find some way to do phase alignment?
-
-    buffer_weight = np.linspace(np.zeros(wave_channels), np.ones(wave_channels), args.blend_length)
-    # print("buffer weight:", buffer_weight.shape)
-    wave_return[:args.blend_length] = buffer_weight * wave_return[:args.blend_length] + (1 - buffer_weight) * wave_cut
-    wave_return = np.clip(wave_return, -1, 1)
-
-    return wave_return, wave_cut_next
-
-# Sound device latency setting
+# Sound device latency setting - desired latency between input and output
+# TODO: dynamically determine latency by adjusting smaller and smaller until processing completes just under desired latency
+# TODO: add UI
 # sd_latency = 'low'
 sd_latency = 0.06
+# blocksize 0 is special setting that makes it determined by latency
+sd_blocksize = 0 
+# number of channels for the audio devices to use
+# TODO: add UI
+sd_channels = 2
 
-wave_buffer = np.zeros((args.wave_buffer_size, 2))
-wave_cut = None
+# context duration needed to understand noise
+# TODO: change user input to seconds, make size in frames determined by sample rate
+# TODO: add UI
+context_buffer_size = 12000
+context_buffer = np.zeros((context_buffer_size, 2))
+context_cut = None
+# number of frames to crossfade between each block to prevent phase misalignment
+# TODO: change user input to a percentage of blocksize
+# TODO: add UI
+context_blend_size = 400
 
 # TODO: Pull noise from recording
+# TODO: add UI
 # noise = np.zeros(args.wave_buffer_size)
 # noise_sr is used for all input and output sample rates so they match up.
 noise_sr, noise = read("noisy.wav")
 # print("noise SR:", noise_sr)
-# TODO: ensure noise sample rate same as signal
 
 ## noise reduction params
 enable_noisereduction = False
@@ -91,38 +65,62 @@ nr_win_length = nr_n_fft
 nr_hop_length = nr_win_length // 4
 
 ## stationary exclusive noise reduction params
+# TODO: only visible when stationary active
 nr_s_n_std_thresh = 1.5
 
 ## non-stationary exclusive noise reduction params
+# TODO: only visible when non-stationary active
 nr_ns_time_constant_s = 2.0
 
-
+# TODO: add ui element for starting audio stream so horrible feedback loop does not start immediately upon launch with speakers
 stop_audio = False
 
 # block_num = 0 # for bug testing
 
+# removes the last context_blend_size worth from the returned context buffer, at the cost of latency
+# crossfades the first context_blend_size with context_cut cut from the previous wave
+# returns the cut part to blend with the next wave
+# |  buffer  |cut|
+#            | next buffer |cut|
+#                          | next next buffer |cut|
+def next_buffer(buffer, buffer_cut, frames):
+    buffer_channels = buffer.shape[1]
+    buffer_left = buffer.shape[0] - frames - context_blend_size
+    buffer_right = buffer.shape[0] - context_blend_size
+    buffer_return = buffer[buffer_left:buffer_right].squeeze()
+    buffer_cut_next = buffer[buffer_right:].squeeze()
+    
+    # TODO: improve blend smoothness, or find some way to do phase alignment?
+
+    buffer_weight = np.linspace(np.zeros(buffer_channels), np.ones(buffer_channels), context_blend_size)
+    buffer_return[:context_blend_size] = buffer_weight * buffer_return[:context_blend_size] + (1 - buffer_weight) * buffer_cut
+    buffer_return = np.clip(buffer_return, -1, 1)
+
+    return buffer_return, buffer_cut_next
+
+# callback used in the sounddevice loop to process the audio
 def callback(indata, outdata, frames, time, status):
-    global wave_buffer
-    global wave_cut
+    global context_buffer
+    global context_cut
     # global block_num
     # print(status)
 
     audio = indata
     
-    wave_buffer = np.concatenate((wave_buffer, audio), axis=0) # appends audio to end of wave_buffer
-    buffer_cut = int(wave_buffer.shape[0] - args.wave_buffer_size)
-    wave_buffer = wave_buffer[max(0, buffer_cut):, ...] # shift back by blocksize, so size is args.wave_buffer_size
+    context_buffer = np.concatenate((context_buffer, audio), axis=0) # appends audio to end of context_buffer
+    buffer_cut = int(context_buffer.shape[0] - context_buffer_size)
+    context_buffer = context_buffer[max(0, buffer_cut):, ...] # shift back by blocksize, so size is context_buffer_size
 
     if enable_noisereduction:
         if nr_stationary:
-                wave = nr.reduce_noise(wave_buffer.transpose(), sr=noise_sr, stationary=True, y_noise=noise.transpose(),
+                wave = nr.reduce_noise(context_buffer.transpose(), sr=noise_sr, stationary=True, y_noise=noise.transpose(),
                                 prop_decrease=nr_prop_decrease, n_std_thresh_stationary=nr_s_n_std_thresh,
                                 freq_mask_smooth_hz=nr_freq_mask_smooth_hz, time_mask_smooth_ms=nr_time_mask_smooth_ms,
                                 chunk_size=nr_chunk_size, n_fft=nr_n_fft, padding=nr_padding,
                                 win_length=nr_win_length, hop_length=nr_hop_length, use_torch=nr_torch)
                 wave = wave.transpose()
         else:
-                wave = nr.reduce_noise(wave_buffer.transpose(), sr=noise_sr, prop_decrease=nr_prop_decrease,
+                wave = nr.reduce_noise(context_buffer.transpose(), sr=noise_sr, prop_decrease=nr_prop_decrease,
                                     time_constant_s=nr_ns_time_constant_s,
                                     freq_mask_smooth_hz=nr_freq_mask_smooth_hz, time_mask_smooth_ms=nr_time_mask_smooth_ms,
                                     chunk_size=nr_chunk_size, n_fft=nr_n_fft, padding=nr_padding,
@@ -136,18 +134,18 @@ def callback(indata, outdata, frames, time, status):
 #     # block_num = block_num + 1
 #     # scipy.io.wavfile.write("out/" + str(block_num) + ".wav", noise_sr, wave)
 
-    if wave_cut is None:
-        wave_left = wave.shape[0] - frames - args.blend_length
-        wave_right = wave.shape[0] - args.blend_length
-        wave_cut = wave[wave_right:, ...].squeeze()
+    if context_cut is None:
+        wave_left = wave.shape[0] - frames - context_blend_size
+        wave_right = wave.shape[0] - context_blend_size
+        context_cut = wave[wave_right:, ...].squeeze()
         wave = wave[wave_left:wave_right, ...]
     else:
-        wave, wave_cut = next_waves(wave, wave_cut, frames)
+        wave, context_cut = next_buffer(wave, context_cut, frames)
     outdata[:] = wave
 
 
-audio_stream = sd.Stream(samplerate=noise_sr, blocksize=args.blocksize, 
-                                     channels=args.channels, latency=sd_latency, callback=callback)
+audio_stream = sd.Stream(samplerate=noise_sr, blocksize=sd_blocksize, 
+                                     channels=sd_channels, latency=sd_latency, callback=callback)
 audio_devices = sd.query_devices()
 audio_hostapis = sd.query_hostapis()
 # Add in the index into each host API dictionary
@@ -186,22 +184,22 @@ layout = [[sg.Button('Noise Reduction Disabled', key='NR_ON', button_color="gray
             # sg.Button('Record Noise', key='NR_REC'),
         sg.Checkbox('Stationary', default=nr_stationary, key='NR_STAT', enable_events=True)],
         [sg.Text('Proportion Noise Decrease:'), 
-            sg.Slider(range=(0.0, 1.0), resolution=0.01, default_value=1.0, key='NR_PROP_DECREASE', orientation='h', change_submits=True)],
+            sg.Slider(range=(0.0, 1.0), resolution=0.01, default_value=nr_prop_decrease, key='NR_PROP_DECREASE', orientation='h', change_submits=True)],
         [sg.Text('Stationary Noise Threshold (σ):'),
-            sg.Slider(range=(0.0, 6.0), resolution=0.01, default_value=1.5, key='NR_S_N_STD_THRESH', orientation='h', change_submits=True)],
+            sg.Slider(range=(0.0, 6.0), resolution=0.01, default_value=nr_s_n_std_thresh, key='NR_S_N_STD_THRESH', orientation='h', change_submits=True)],
         [sg.Text('Mask Smoothing [Frequency (Hz), Time (ms)]:')],
-        [sg.Slider(range=(100, 20000), resolution=10, default_value=500, key='NR_FREQ_MASK_SMOOTH_HZ', orientation='h', change_submits=True),
-         sg.Slider(range=(1, 1000), resolution=1, default_value=50, key='NR_TIME_MASK_SMOOTH_MS', orientation='h', change_submits=True)],
+        [sg.Slider(range=(noise_sr / (nr_n_fft / 2), 20000), resolution=10, default_value=nr_freq_mask_smooth_hz, key='NR_FREQ_MASK_SMOOTH_HZ', orientation='h', change_submits=True),
+         sg.Slider(range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000), resolution=1, default_value=nr_time_mask_smooth_ms, key='NR_TIME_MASK_SMOOTH_MS', orientation='h', change_submits=True)],
         [sg.Text('Chunk Size (samples):'),
-            sg.Slider(range=(10000, 120000), resolution=1000, default_value=60000, key='NR_CHUNK_SIZE', orientation='h', change_submits=True)],
+            sg.Slider(range=(10000, 120000), resolution=1000, default_value=nr_chunk_size, key='NR_CHUNK_SIZE', orientation='h', change_submits=True)],
         [sg.Text('# FFTs:'),
-            sg.Slider(range=(100, 8192), resolution=2, default_value=1024, key='NR_N_FFT', orientation='h', change_submits=True)],
+            sg.Slider(range=(200, 8192), resolution=2, default_value=nr_n_fft, key='NR_N_FFT', orientation='h', change_submits=True)],
         [sg.Text('Padding:'),
-            sg.Slider(range=(10000, 60000), resolution=1000, default_value=30000, key='NR_PADDING', orientation='h', change_submits=True)],
+            sg.Slider(range=(10000, 60000), resolution=1000, default_value=nr_padding, key='NR_PADDING', orientation='h', change_submits=True)],
         [sg.Text('Window Length:'),
-            sg.Slider(range=(100, 1024), resolution=2, default_value=1024, key='NR_WIN_LENGTH', orientation='h', change_submits=True)],
+            sg.Slider(range=(1, 1024), resolution=2, default_value=nr_win_length, key='NR_WIN_LENGTH', orientation='h', change_submits=True)],
         [sg.Text('Hop Length:'),
-            sg.Slider(range=(25, 512), resolution=1, default_value=1024//4, key='NR_HOP_LENGTH', orientation='h', change_submits=True)],
+            sg.Slider(range=(1, 512), resolution=1, default_value=nr_hop_length, key='NR_HOP_LENGTH', orientation='h', change_submits=True)],
         [sg.ButtonMenu('Device Settings', audio_device_menu_layout, key='DEVICE_SETTINGS')]]
 
 window = sg.Window('Noise Reducer', layout)
@@ -225,7 +223,7 @@ while True:
     elif event == 'NR_STAT':
         nr_stationary = values['NR_STAT']
     elif event == 'NR_REC':
-        noise[:] = wave_buffer
+        noise[:] = context_buffer
         # TODO: re-add way to record noise
         # noise_threshold = torch.max(log_norm(preprocess(noise)))
     elif event == 'NR_PROP_DECREASE':
@@ -234,28 +232,64 @@ while True:
         nr_s_n_std_thresh = float(values['NR_S_N_STD_THRESH'])
     elif event == 'NR_FREQ_MASK_SMOOTH_HZ':
         nr_freq_mask_smooth_hz = int(values['NR_FREQ_MASK_SMOOTH_HZ'])
-        # constraint: nr_freq_mask_smooth_hz >= noise_sr / (nr_n_fft / 2)
+        # constraint (see NR_N_FFT, TODO: noise update): nr_freq_mask_smooth_hz >= noise_sr / (nr_n_fft / 2)
     elif event == 'NR_TIME_MASK_SMOOTH_MS':
+        # constraint (see NR_HOP_LENGTH, NR_WIN_LENGTH, NR_FFT, TODO: noise update): nr_time_mask_smooth_ms >= (nr_hop_length / noise_sr) * 1000
         nr_time_mask_smooth_ms = int(values['NR_TIME_MASK_SMOOTH_MS'])
     elif event == 'NR_CHUNK_SIZE':
         nr_chunk_size = int(values['NR_CHUNK_SIZE'])
     elif event == 'NR_N_FFT':
         nr_n_fft = int(values['NR_N_FFT'])
         # constraint: 0 < nr_win_length <= n_fft
-        # constraint: nr_freq_mask_smooth_hz >= noise_sr / (nr_n_fft / 2)
         if nr_n_fft < nr_win_length:
-            window['NR_WIN_LENGTH'].update(nr_n_fft, range=(100, nr_n_fft))
             nr_win_length = nr_n_fft
+            window['NR_WIN_LENGTH'].update(nr_win_length, range=(1, nr_n_fft))
+            # inherited constraint: 0 < hop_length <= win_length
+            if nr_hop_length > nr_win_length:
+                nr_hop_length = nr_win_length
+                window['NR_HOP_LENGTH'].update(nr_hop_length, range=(1, nr_win_length))
+                # inherited2 constraint: nr_time_mask_smooth_ms >= (nr_hop_length / noise_sr) * 1000
+                if nr_time_mask_smooth_ms < (nr_hop_length / noise_sr) * 1000:
+                    nr_time_mask_smooth_ms = math.ceil((nr_hop_length / noise_sr) * 1000)
+                    window['NR_TIME_MASK_SMOOTH_MS'].update(nr_time_mask_smooth_ms, range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000))
+                else:
+                    window['NR_TIME_MASK_SMOOTH_MS'].update(range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000))
+            else:
+                window['NR_HOP_LENGTH'].update(range=(1, nr_win_length))
         else:
-            window['NR_WIN_LENGTH'].update(range=(100, nr_n_fft))
-
+            window['NR_WIN_LENGTH'].update(range=(1, nr_n_fft))
+        # constraint: nr_freq_mask_smooth_hz >= noise_sr / (nr_n_fft / 2)
+        if nr_freq_mask_smooth_hz < noise_sr / (nr_n_fft / 2):
+            nr_freq_mask_smooth_hz = noise_sr / (nr_n_fft / 2)
+            window['NR_FREQ_MASK_SMOOTH_HZ'].update(nr_freq_mask_smooth_hz, range=(noise_sr / (nr_n_fft / 2), 20000))
+        else:
+            window['NR_FREQ_MASK_SMOOTH_HZ'].update(range=(noise_sr / (nr_n_fft / 2), 20000))
     elif event == 'NR_PADDING':
         nr_padding = int(values['NR_PADDING'])
     elif event == 'NR_WIN_LENGTH':
+        # constraint (see NR_N_FFT): 0 < win_length <= n_fft
         nr_win_length = int(values['NR_WIN_LENGTH'])
-        # constraint: 0 < win_length <= n_fft
+        # constraint: 0 < hop_length <= win_length
+        if nr_hop_length > nr_win_length:
+            nr_hop_length = nr_win_length
+            window['NR_HOP_LENGTH'].update(nr_hop_length, range=(1, nr_win_length))
+            # inherited constraint: nr_time_mask_smooth_ms >= (nr_hop_length / noise_sr) * 1000
+            if nr_time_mask_smooth_ms < (nr_hop_length / noise_sr) * 1000:
+                nr_time_mask_smooth_ms = math.ceil((nr_hop_length / noise_sr) * 1000)
+                window['NR_TIME_MASK_SMOOTH_MS'].update(nr_time_mask_smooth_ms, range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000))
+            else:
+                window['NR_TIME_MASK_SMOOTH_MS'].update(range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000))
+        else:
+            window['NR_HOP_LENGTH'].update(range=(1, nr_win_length))
     elif event == 'NR_HOP_LENGTH':
+        # constraint (see NR_WIN_LENGTH, NR_FFT): 0 < hop_length <= win_length
         nr_hop_length = int(values['NR_HOP_LENGTH'])
+        # constraint: nr_time_mask_smooth_ms >= (nr_hop_length / noise_sr) * 1000
+        if nr_time_mask_smooth_ms < (nr_hop_length / noise_sr) * 1000:
+            nr_time_mask_smooth_ms = math.ceil((nr_hop_length / noise_sr) * 1000)
+            window['NR_TIME_MASK_SMOOTH_MS'].update(nr_time_mask_smooth_ms, range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000))
+        else:
+            window['NR_TIME_MASK_SMOOTH_MS'].update(range=(math.ceil((nr_hop_length / noise_sr) * 1000), 5000))
     elif event == 'DEVICE_SETTINGS':
         # make sure the value of DEVICE_SETTINGS is a string before comparing it to key strings
         if not isinstance(values['DEVICE_SETTINGS'], str):
@@ -277,15 +311,15 @@ while True:
             output_ID = int(audio_hostapis[api_ID]['default_output_device'])
             # For some reason some of the default devices are invalid. Try to instead find a valid device for that host API if it's invalid.
             try:
-                sd.check_input_settings(device = input_ID, samplerate=noise_sr, blocksize=args.blocksize, 
-                                     channels=args.channels, latency=sd_latency)
+                sd.check_input_settings(device = input_ID, samplerate=noise_sr, blocksize=sd_blocksize, 
+                                     channels=sd_channels, latency=sd_latency)
             except:
                 found_valid = False
                 for device in input_devices[api_ID]:
                     try:
                         input_ID = device['index']
-                        sd.check_input_settings(device = input_ID, samplerate=noise_sr, blocksize=args.blocksize, 
-                                     channels=args.channels, latency=sd_latency)
+                        sd.check_input_settings(device = input_ID, samplerate=noise_sr, blocksize=sd_blocksize, 
+                                     channels=sd_channels, latency=sd_latency)
                     except:
                         # print('input device', input_ID, 'causes exception')
                         continue
@@ -298,15 +332,15 @@ while True:
                     print('No valid input device found for this host API :(')
             
             try:
-                sd.check_output_settings(device = output_ID, samplerate=noise_sr, blocksize=args.blocksize, 
-                                     channels=args.channels, latency=sd_latency)
+                sd.check_output_settings(device = output_ID, samplerate=noise_sr, blocksize=sd_blocksize, 
+                                     channels=sd_channels, latency=sd_latency)
             except:
                 found_valid = False
                 for device in output_devices[api_ID]:
                     try:
                         output_ID = device['index']
-                        sd.check_output_settings(device = output_ID, samplerate=noise_sr, blocksize=args.blocksize,
-                                     channels=args.channels, latency=sd_latency)
+                        sd.check_output_settings(device = output_ID, samplerate=noise_sr, blocksize=sd_blocksize,
+                                     channels=sd_channels, latency=sd_latency)
                     except:
                         # print('output device', output_ID, 'causes exception')
                         continue
@@ -322,8 +356,8 @@ while True:
             
             # Stop the audio stream and replace it with a new one that uses the specified input device, then start it back.
             audio_stream.stop()
-            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=args.blocksize, 
-                                     channels=args.channels, latency=sd_latency, callback=callback)
+            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=sd_blocksize, 
+                                     channels=sd_channels, latency=sd_latency, callback=callback)
             audio_stream.start()
 
         elif values['DEVICE_SETTINGS'][-6:] == '_INPUT':
@@ -334,8 +368,8 @@ while True:
             
             # Stop the audio stream and replace it with a new one that uses the specified input device, then start it back.
             audio_stream.stop()
-            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=args.blocksize,  
-                                     channels=args.channels, latency=sd_latency, callback=callback)
+            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=sd_blocksize,  
+                                     channels=sd_channels, latency=sd_latency, callback=callback)
             audio_stream.start()
 
         elif values['DEVICE_SETTINGS'][-7:] == '_OUTPUT':
@@ -346,6 +380,6 @@ while True:
             
             # Stop the audio stream and replace it with a new one that uses the specified input device, then start it back.
             audio_stream.stop()
-            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=args.blocksize, 
-                                     channels=args.channels, latency=sd_latency, callback=callback)
+            audio_stream = sd.Stream(device=(input_ID, output_ID), samplerate=noise_sr, blocksize=sd_blocksize, 
+                                     channels=sd_channels, latency=sd_latency, callback=callback)
             audio_stream.start()
